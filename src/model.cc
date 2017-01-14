@@ -9,8 +9,8 @@
 
 #include "model.h"
 
-#include <assert.h>
-
+#include <cassert>
+#include <cmath>
 #include <algorithm>
 
 #include "utils.h"
@@ -53,28 +53,64 @@ real Model::binaryLogistic(int32_t target, bool label, real lr) {
   }
 }
 
-real Model::negativeSampling(int32_t target, real lr) {
-  real loss = 0.0;
+real Model::negativeSampling(int32_t target, real lr, real weight) {
   grad_.zero();
-  for (int32_t n = 0; n <= args_->neg; n++) {
-    if (n == 0) {
-      loss += binaryLogistic(target, true, lr);
-    } else {
-      loss += binaryLogistic(getNegative(target), false, lr);
+  lr *= std::abs(weight);
+  if (weight > 0) {
+    real loss = 0.0;
+    for (int32_t n = 0; n <= args_->neg; n++) {
+      if (n == 0) {
+        loss += binaryLogistic(target, true, lr);
+      } else {
+        loss += binaryLogistic(getNegative(target), false, lr);
+      }
     }
+    return loss;
+  } else {
+    return binaryLogistic(target, false, lr);
   }
-  return loss;
 }
 
-real Model::hierarchicalSoftmax(int32_t target, real lr) {
-  real loss = 0.0;
+namespace {
+  const real max_odds = 10.;
+  const real log_max_odds = std::log(max_odds);
+}
+
+real Model::hierarchicalSoftmax(int32_t target, real lr, real weight) {
   grad_.zero();
   const std::vector<bool>& binaryCode = codes[target];
   const std::vector<int32_t>& pathToRoot = paths[target];
-  for (int32_t i = 0; i < pathToRoot.size(); i++) {
-    loss += binaryLogistic(pathToRoot[i], binaryCode[i], lr);
+  lr *= std::abs(weight);
+  if (weight > 0) {
+    real loss = 0.0;
+    for (int32_t i = 0; i < pathToRoot.size(); i++) {
+      loss += binaryLogistic(pathToRoot[i], binaryCode[i], lr);
+    }
+    return loss;
+  } else {
+    real path_log_prob = 0.;
+    std::vector<real> probs;
+    probs.reserve(pathToRoot.size());
+    for (size_t i = 0; i < pathToRoot.size(); i++) {
+      real prob = sigmoid(wo_->dotRow(hidden_, pathToRoot[i]));
+      if (!binaryCode[i]) {
+        prob = 1 - prob;
+      }
+      path_log_prob += log(prob);
+      probs.push_back(prob);
+    }
+    real path_log_complement_prob = log(-std::expm1(path_log_prob));
+    real log_odds = std::min(log_max_odds, path_log_prob - path_log_complement_prob);
+    for (int32_t i = 0; i < pathToRoot.size(); i++) {
+      real alpha = -std::exp(log_odds + log(1 - probs[i])) * lr;
+      if (!binaryCode[i]) {
+        alpha = -alpha;
+      }
+      grad_.addRow(*wo_, pathToRoot[i], alpha);
+      wo_->addRow(hidden_, pathToRoot[i], alpha);
+    }
+    return -path_log_complement_prob;
   }
-  return loss;
 }
 
 void Model::computeOutputSoftmax(Vector& hidden, Vector& output) const {
@@ -84,7 +120,7 @@ void Model::computeOutputSoftmax(Vector& hidden, Vector& output) const {
     max = std::max(output[i], max);
   }
   for (int32_t i = 0; i < osz_; i++) {
-    output[i] = exp(output[i] - max);
+    output[i] = std::exp(output[i] - max);
     z += output[i];
   }
   for (int32_t i = 0; i < osz_; i++) {
@@ -96,16 +132,34 @@ void Model::computeOutputSoftmax() {
   computeOutputSoftmax(hidden_, output_);
 }
 
-real Model::softmax(int32_t target, real lr) {
+real Model::softmax(int32_t target, real lr, real weight) {
   grad_.zero();
   computeOutputSoftmax();
-  for (int32_t i = 0; i < osz_; i++) {
-    real label = (i == target) ? 1.0 : 0.0;
-    real alpha = lr * (label - output_[i]);
-    grad_.addRow(*wo_, i, alpha);
-    wo_->addRow(hidden_, i, alpha);
+  lr *= std::abs(weight);
+  if (weight > 0) {
+      for (int32_t i = 0; i < osz_; i++) {
+        real label = (i == target) ? 1.0 : 0.0;
+        real alpha = lr * (label - output_[i]);
+        grad_.addRow(*wo_, i, alpha);
+        wo_->addRow(hidden_, i, alpha);
+      }
+      return -log(output_[target]);
+  } else {
+    real log_prob = log(output_[target]),
+         log_complement_prob = log(1 - output_[target]),
+         log_odds = log_prob - log_complement_prob;
+    for (int32_t i = 0; i < osz_; i++) {
+        real alpha = lr;
+        if (log_odds < log_max_odds) {
+          alpha *= (i == target) ? (-output_[i]) : std::exp(log_odds + log(output_[i]));
+        } else {
+          alpha *= max_odds * ((i == target) ? (output_[i] - 1) : output_[i]);
+        }
+        grad_.addRow(*wo_, i, alpha);
+        wo_->addRow(hidden_, i, alpha);
+    }
+    return -log_complement_prob;
   }
-  return -log(output_[target]);
 }
 
 void Model::computeHidden(const std::vector<int32_t>& input, Vector& hidden) const {
@@ -126,6 +180,7 @@ void Model::predict(const std::vector<int32_t>& input, int32_t k,
                     std::vector<std::pair<real, int32_t>>& heap,
                     Vector& hidden, Vector& output) const {
   assert(k > 0);
+  heap.clear();
   heap.reserve(k + 1);
   computeHidden(input, hidden);
   if (args_->loss == loss_name::hs) {
@@ -179,19 +234,27 @@ void Model::dfs(int32_t k, int32_t node, real score,
   dfs(k, tree[node].right, score + log(f), heap, hidden);
 }
 
-void Model::update(const std::vector<int32_t>& input, int32_t target, real lr) {
+void Model::update(const std::vector<int32_t>& input, int32_t target, real lr, real weight) {
   assert(target >= 0);
   assert(target < osz_);
   if (input.size() == 0) return;
   computeHidden(input, hidden_);
-  if (args_->loss == loss_name::ns) {
-    loss_ += negativeSampling(target, lr);
-  } else if (args_->loss == loss_name::hs) {
-    loss_ += hierarchicalSoftmax(target, lr);
-  } else {
-    loss_ += softmax(target, lr);
+  real curr_loss;
+  switch (args_->loss) {
+    case loss_name::ns:
+      curr_loss = negativeSampling(target, lr, weight);
+      break;
+    case loss_name::hs:
+      curr_loss = hierarchicalSoftmax(target, lr, weight);
+      break;
+    case loss_name::softmax:
+      curr_loss = softmax(target, lr, weight);
+      break;
+    default:
+      assert(false);
   }
-  nexamples_ += 1;
+  loss_ += curr_loss * std::abs(weight);
+  nexamples_ += std::abs(weight);
 
   if (args_->model == model_name::sup) {
     grad_.mul(1.0 / input.size());

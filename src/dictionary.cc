@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <iterator>
 #include <unordered_map>
+#include <cmath>
 
 namespace fasttext {
 
@@ -42,18 +43,20 @@ int32_t Dictionary::find(const std::string& w) const {
   return h;
 }
 
-void Dictionary::add(const std::string& w) {
+void Dictionary::add(const std::string& w, entry_type type) {
   int32_t h = find(w);
   ntokens_++;
   if (word2int_[h] == -1) {
     entry e;
     e.word = w;
     e.count = 1;
-    e.type = (w.find(args_->label) == 0) ? entry_type::label : entry_type::word;
+    e.type = type;
     words_.push_back(e);
     word2int_[h] = size_++;
   } else {
-    words_[word2int_[h]].count++;
+    entry& e = words_[word2int_[h]];
+    assert(type == e.type);
+    e.count++;
   }
 }
 
@@ -144,16 +147,15 @@ void Dictionary::initNgrams() {
   }
 }
 
-bool Dictionary::readWord(std::istream& in, std::string& word) const
-{
+bool Dictionary::readToken(std::istream& in, std::string& token) const {
   char c;
   std::streambuf& sb = *in.rdbuf();
-  word.clear();
+  token.clear();
   while ((c = sb.sbumpc()) != EOF) {
     if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\v' || c == '\f' || c == '\0') {
-      if (word.empty()) {
+      if (token.empty()) {
         if (c == '\n') {
-          word += EOS;
+          token += EOS;
           return true;
         }
         continue;
@@ -163,18 +165,53 @@ bool Dictionary::readWord(std::istream& in, std::string& word) const
         return true;
       }
     }
-    word.push_back(c);
+    token.push_back(c);
   }
   // trigger eofbit
   in.get();
-  return !word.empty();
+  return !token.empty();
+}
+
+bool Dictionary::readWord(std::istream& in, std::string& word, entry_type& type, real& label_weight) const {
+  bool ret = this->readToken(in, word);
+  type = (
+    args_->label.length() < word.length()
+    && std::equal(args_->label.begin(), args_->label.end(), word.begin())
+  ) ? entry_type::label : entry_type::word;
+  label_weight = NAN;
+  if (type == entry_type::word) {
+    return ret;
+  }
+
+  std::string weight_sep("|||");  // TODO move this into args_?
+  bool ends_with_weight_sep = (
+    weight_sep.length() * 2 + args_->label.length() < word.length()
+    && std::equal(weight_sep.rbegin(), weight_sep.rend(), word.rbegin())
+  );
+  if (!ends_with_weight_sep) {
+    return ret;
+  }
+
+  size_t weight_sep_pos = word.rfind(weight_sep, word.length() - weight_sep.length() * 2 - 1);
+  if (weight_sep_pos == std::string::npos) {
+    return ret;
+  }
+
+  size_t weight_substr_pos = weight_sep_pos + weight_sep.length();
+  size_t weight_substr_len = word.length() - weight_sep.length() - weight_substr_pos;
+  std::string weight_substr = word.substr(weight_substr_pos, weight_substr_len);
+  label_weight = std::stof(weight_substr);
+  word.erase(weight_sep_pos);
+  return ret;
 }
 
 void Dictionary::readFromFile(std::istream& in) {
   std::string word;
+  entry_type type;
+  real weight;
   int64_t minThreshold = 1;
-  while (readWord(in, word)) {
-    add(word);
+  while (readWord(in, word, type, weight)) {
+    add(word, type);
     if (ntokens_ % 1000000 == 0 && args_->verbose > 1) {
       std::cout << "\rRead " << ntokens_  / 1000000 << "M words" << std::flush;
     }
@@ -250,28 +287,29 @@ void Dictionary::addNgrams(std::vector<int32_t>& line, int32_t n) const {
 
 int32_t Dictionary::getLine(std::istream& in,
                             std::vector<int32_t>& words,
-                            std::vector<int32_t>& labels,
+                            std::vector<std::pair<int32_t, real>>& label_weight_pairs,
                             std::minstd_rand& rng) const {
   std::uniform_real_distribution<> uniform(0, 1);
   std::string token;
+  entry_type type;
+  real weight;
   int32_t ntokens = 0;
   words.clear();
-  labels.clear();
+  label_weight_pairs.clear();
   if (in.eof()) {
     in.clear();
     in.seekg(std::streampos(0));
   }
-  while (readWord(in, token)) {
+  while (readWord(in, token, type, weight)) {
     if (token == EOS) break;
     int32_t wid = getId(token);
     if (wid < 0) continue;
-    entry_type type = getType(wid);
+    assert(type == getType(wid));
     ntokens++;
-    if (type == entry_type::word && !discard(wid, uniform(rng))) {
-      words.push_back(wid);
-    }
     if (type == entry_type::label) {
-      labels.push_back(wid - nwords_);
+      label_weight_pairs.push_back(std::make_pair(wid - nwords_, weight));
+    } else if (type == entry_type::word && !discard(wid, uniform(rng))) {
+      words.push_back(wid);
     }
     if (words.size() > MAX_LINE_SIZE && args_->model != model_name::sup) break;
   }

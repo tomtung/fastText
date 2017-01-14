@@ -46,7 +46,7 @@ class Model {
     int32_t isz_;
     int32_t osz_;
     real loss_;
-    int64_t nexamples_;
+    double nexamples_;
     real* t_sigmoid;
     real* t_log;
     // used for negative sampling:
@@ -72,9 +72,9 @@ class Model {
     ~Model();
 
     real binaryLogistic(int32_t, bool, real);
-    real negativeSampling(int32_t, real);
-    real hierarchicalSoftmax(int32_t, real);
-    real softmax(int32_t, real);
+    real negativeSampling(int32_t, real, real);
+    real hierarchicalSoftmax(int32_t, real, real);
+    real softmax(int32_t, real, real);
 
     void predict(const std::vector<int32_t>&, int32_t,
                  std::vector<std::pair<real, int32_t>>&,
@@ -86,7 +86,7 @@ class Model {
              Vector&) const;
     void findKBest(int32_t, std::vector<std::pair<real, int32_t>>&,
                    Vector&, Vector&) const;
-    void update(const std::vector<int32_t>&, int32_t, real);
+    void update(const std::vector<int32_t>&, int32_t, real, real=1);
     void computeHidden(const std::vector<int32_t>&, Vector&) const;
     void computeOutputSoftmax(Vector&, Vector&) const;
     void computeOutputSoftmax();

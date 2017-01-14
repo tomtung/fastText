@@ -67,8 +67,9 @@ class Dictionary {
     const std::vector<int32_t> getNgrams(const std::string&) const;
     void computeNgrams(const std::string&, std::vector<int32_t>&) const;
     uint32_t hash(const std::string& str) const;
-    void add(const std::string&);
-    bool readWord(std::istream&, std::string&) const;
+    void add(const std::string&, entry_type);
+    bool readToken(std::istream&, std::string&) const;
+    bool readWord(std::istream&, std::string&, entry_type&, real&) const;
     void readFromFile(std::istream&);
     std::string getLabel(int32_t) const;
     void save(std::ostream&) const;
@@ -76,7 +77,7 @@ class Dictionary {
     std::vector<int64_t> getCounts(entry_type) const;
     void addNgrams(std::vector<int32_t>&, int32_t) const;
     int32_t getLine(std::istream&, std::vector<int32_t>&,
-                    std::vector<int32_t>&, std::minstd_rand&) const;
+                    std::vector<std::pair<int32_t, real>>&, std::minstd_rand&) const;
     void threshold(int64_t, int64_t);
 };
 

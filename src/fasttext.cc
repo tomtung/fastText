@@ -9,14 +9,14 @@
 
 #include "fasttext.h"
 
-#include <math.h>
-
+#include <cmath>
 #include <iostream>
 #include <iomanip>
 #include <thread>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
 
 namespace fasttext {
 
@@ -105,11 +105,17 @@ void FastText::printInfo(real progress, real loss) {
 
 void FastText::supervised(Model& model, real lr,
                           const std::vector<int32_t>& line,
-                          const std::vector<int32_t>& labels) {
-  if (labels.size() == 0 || line.size() == 0) return;
-  std::uniform_int_distribution<> uniform(0, labels.size() - 1);
-  int32_t i = uniform(model.rng);
-  model.update(line, labels[i], lr);
+                          const std::vector<std::pair<int32_t, real>>& label_weight_pairs) {
+  if (label_weight_pairs.empty() || line.empty()) {
+    return;
+  }
+  const real default_weight = 1. / label_weight_pairs.size();
+  for (auto label_weight_pair : label_weight_pairs) {
+    if (std::isnan(label_weight_pair.second)) {
+      label_weight_pair.second = default_weight;
+    }
+    model.update(line, label_weight_pair.first, lr, label_weight_pair.second);
+  }
 }
 
 void FastText::cbow(Model& model, real lr,
@@ -146,22 +152,36 @@ void FastText::skipgram(Model& model, real lr,
 void FastText::test(std::istream& in, int32_t k) {
   int32_t nexamples = 0, nlabels = 0;
   double precision = 0.0;
-  std::vector<int32_t> line, labels;
+  std::vector<int32_t> line;
+  std::vector<std::pair<int32_t, real>> label_weight_pairs;
+  std::unordered_set<int32_t> correct_labels;
+  std::vector<std::pair<real, int32_t>> model_predictions;
 
   while (in.peek() != EOF) {
-    dict_->getLine(in, line, labels, model_->rng);
-    dict_->addNgrams(line, args_->wordNgrams);
-    if (labels.size() > 0 && line.size() > 0) {
-      std::vector<std::pair<real, int32_t>> modelPredictions;
-      model_->predict(line, k, modelPredictions);
-      for (auto it = modelPredictions.cbegin(); it != modelPredictions.cend(); it++) {
-        if (std::find(labels.begin(), labels.end(), it->second) != labels.end()) {
-          precision += 1.0;
-        }
-      }
-      nexamples++;
-      nlabels += labels.size();
+    dict_->getLine(in, line, label_weight_pairs, model_->rng);
+    if (line.empty() || label_weight_pairs.empty()) {
+      continue;
     }
+    correct_labels.clear();
+    correct_labels.reserve(label_weight_pairs.size());
+    for (const std::pair<int32_t, real>& label_weight_pair : label_weight_pairs) {
+        if (std::isnan(label_weight_pair.second) || label_weight_pair.second > 0) {
+          correct_labels.insert(label_weight_pair.first);
+        }
+    }
+    if (correct_labels.empty()) {
+      continue;
+    }
+
+    dict_->addNgrams(line, args_->wordNgrams);
+    model_->predict(line, k, model_predictions);
+
+    for (auto it = model_predictions.cbegin(); it != model_predictions.cend(); it++) {
+      int32_t predicted_label = it->second;
+      precision += correct_labels.count(predicted_label);
+    }
+    nexamples++;
+    nlabels += correct_labels.size();
   }
   std::cout << std::setprecision(3);
   std::cout << "P@" << k << ": " << precision / (k * nexamples) << std::endl;
@@ -171,15 +191,16 @@ void FastText::test(std::istream& in, int32_t k) {
 
 void FastText::predict(std::istream& in, int32_t k,
                        std::vector<std::pair<real,std::string>>& predictions) const {
-  std::vector<int32_t> words, labels;
-  dict_->getLine(in, words, labels, model_->rng);
+  std::vector<int32_t> words;
+  std::vector<std::pair<int32_t, real>> label_weight_pairs;
+  dict_->getLine(in, words, label_weight_pairs, model_->rng);
   dict_->addNgrams(words, args_->wordNgrams);
+  predictions.clear();
   if (words.empty()) return;
   Vector hidden(args_->dim);
   Vector output(dict_->nlabels());
   std::vector<std::pair<real,int32_t>> modelPredictions;
   model_->predict(words, k, modelPredictions, hidden, output);
-  predictions.clear();
   for (auto it = modelPredictions.cbegin(); it != modelPredictions.cend(); it++) {
     predictions.push_back(std::make_pair(it->first, dict_->getLabel(it->second)));
   }
@@ -199,7 +220,7 @@ void FastText::predict(std::istream& in, int32_t k, bool print_prob) {
       }
       std::cout << it->second;
       if (print_prob) {
-        std::cout << ' ' << exp(it->first);
+        std::cout << ' ' << std::exp(it->first);
       }
     }
     std::cout << std::endl;
@@ -216,10 +237,11 @@ void FastText::wordVectors() {
 }
 
 void FastText::textVectors() {
-  std::vector<int32_t> line, labels;
+  std::vector<int32_t> line;
+  std::vector<std::pair<int32_t, real>> label_weight_pairs;
   Vector vec(args_->dim);
   while (std::cin.peek() != EOF) {
-    dict_->getLine(std::cin, line, labels, model_->rng);
+    dict_->getLine(std::cin, line, label_weight_pairs, model_->rng);
     dict_->addNgrams(line, args_->wordNgrams);
     vec.zero();
     for (auto it = line.cbegin(); it != line.cend(); ++it) {
@@ -253,14 +275,15 @@ void FastText::trainThread(int32_t threadId) {
 
   const int64_t ntokens = dict_->ntokens();
   int64_t localTokenCount = 0;
-  std::vector<int32_t> line, labels;
+  std::vector<int32_t> line;
+  std::vector<std::pair<int32_t, real>> label_weight_pairs;
   while (tokenCount < args_->epoch * ntokens) {
     real progress = real(tokenCount) / (args_->epoch * ntokens);
     real lr = args_->lr * (1.0 - progress);
-    localTokenCount += dict_->getLine(ifs, line, labels, model.rng);
+    localTokenCount += dict_->getLine(ifs, line, label_weight_pairs, model.rng);
     if (args_->model == model_name::sup) {
       dict_->addNgrams(line, args_->wordNgrams);
-      supervised(model, lr, line, labels);
+      supervised(model, lr, line, label_weight_pairs);
     } else if (args_->model == model_name::cbow) {
       cbow(model, lr, line);
     } else if (args_->model == model_name::sg) {
@@ -301,7 +324,7 @@ void FastText::loadVectors(std::string filename) {
     std::string word;
     in >> word;
     words.push_back(word);
-    dict_->add(word);
+    dict_->add(word, entry_type::word);
     for (size_t j = 0; j < dim; j++) {
       in >> mat->data_[i * dim + j];
     }
